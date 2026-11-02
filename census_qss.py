@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-census_qss.py: QSS (Quarterly Services Survey) metadata + sample series.
+census_qss.py: QSS (Quarterly Services Survey) metadata + sample series
 
-Same steps as the team's MRTS and M3 work:
-  1. Collect the available metadata (variables, groups, geography, tags, examples,
-     catalog entry, code lists)
-  2. Look at what information exists at the dataset, series and observation levels
-     (pulls one year of data, checks coverage, the series key, codes and flags)
-  3. Pick 5 representative series and pull a small sample of observations
 
 SETUP
   pip install requests pandas
@@ -225,7 +219,7 @@ print("data_type_codes on error rows:",
 
 
 
-# 3. Five representative series
+# Five representative series
 
 # Picks cover the main kinds of QSS series. If an exact combination does not exist,
 # the most common category for that measure + adjustment is used instead.
@@ -266,9 +260,8 @@ sample_observations.to_csv(AUDIT / "census_qss_sample_observations.csv", index=F
 display(sample_observations)
 
 
-# ===========================================================================
-# 4. Save the summary and findings
-# ===========================================================================
+
+# Save the summary and findings
 
 required = [n for n, d in variables.items()
             if str(d.get("required", "")).lower() == "true" and not d.get("predicateOnly")]
