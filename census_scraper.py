@@ -74,6 +74,22 @@ SMALL_STATE = "56"       # Wyoming, for datasets that only work inside a state
 TIMEOUT = 180            # seconds per request
 SINCE = None             # set by --since
 TIME_LIKE = re.compile(r"^(year|quarter|month|period|date_?code)$", re.I)
+# numeric-typed columns that are really category codes, not measurements (AGECAT, STATE, NAICS2017 ...)
+CODE_NAME = re.compile(r"(cat|code|_id|fips|^state|^county|naics\d*|sic\d*|geo_?id|flag)$", re.I)
+CODE_LABEL = re.compile(r"\b(code|category|fips|identifier|flag)\b", re.I)
+
+
+def looks_like_code(name, info):
+    return bool(CODE_NAME.search(name) or CODE_LABEL.search(str(info.get("label", ""))))
+
+
+# string-typed columns that are really measurements (SAHIE's NIC_MOE etc. are typed "string")
+MEASURE_NAME = re.compile(r"_(moe|pt|lb90|ub90|se|cv)$", re.I)
+MEASURE_LABEL = re.compile(r"margin of error|standard error|confidence interval|coefficient of variation", re.I)
+
+
+def is_measure(name, info):
+    return bool(MEASURE_NAME.search(name) or MEASURE_LABEL.search(str(info.get("label", ""))))
 
 _session = None
 
@@ -252,12 +268,15 @@ def geo_options(fips):
 def plan_variables(v):
     """Split variables into series dimensions (codes/labels) and value columns, in request chunks."""
     usable = [n for n, i in v.items() if not i.get("predicateOnly") and n not in SKIP]
-    required = [n for n in usable if str(v[n].get("required", "")).lower() == "true"]
+    # "required": "true" and "default displayed" both mark the dataset's dimensions
+    # (SAHIE's AGECAT/SEXCAT/RACECAT/IPRCAT are "default displayed" strings)
+    required = [n for n in usable if str(v[n].get("required", "")).lower() in ("true", "default displayed")]
     if "cell_value" in v:                                   # economic indicators style: one value column
         values = ["cell_value"]
     else:
         values = [n for n in usable
-                  if v[n].get("predicateType") in ("int", "float") and n not in required]
+                  if (v[n].get("predicateType") in ("int", "float") or is_measure(n, v[n]))
+                  and n not in required and not TIME_LIKE.match(n) and not looks_like_code(n, v[n])]
     required = [n for n in required if n not in values]     # cell_value is "required" but it is the value
     strings = [n for n in usable if n not in values]
     strings = (required + [n for n in strings if n not in required])
@@ -335,10 +354,16 @@ def choose_key(records, base_cols, candidates):
                 seen.add(k)
         return d
 
-    key, cands = list(base_cols), list(candidates)
+    # a column with a different value on (almost) every row is a measurement, not a series code
+    # (e.g. SAHIE's NIC_MOE): using it would make one series per row
+    distinct = {c: len({r.get(c) for r in records}) for c in candidates}
+    key = list(base_cols)
+    cands = [c for c in candidates if distinct[c] <= max(1, len(records) // 2)]
     d = dups(key)
     while d and cands:
-        scored = sorted(cands, key=lambda c: (dups(key + [c]), len({r.get(c) for r in records})))
+        # fewest duplicates, then fewest distinct values, then prefer codes (AGECAT) over labels (AGE_DESC)
+        scored = sorted(cands, key=lambda c: (dups(key + [c]), distinct[c],
+                                              not CODE_NAME.search(c), c.upper().endswith("_DESC")))
         best = scored[0]
         nd = dups(key + [best])
         if nd >= d:
@@ -398,7 +423,9 @@ def process_dataset(job):
            "key_columns": "", "message": ""}
 
     def done(status, message=""):
-        row.update(status=status, message=redact(message)[:300], seconds=round(time.time() - t0, 1))
+        size = sum(p.stat().st_size for p in series_dir.glob("*.json")) if series_dir.exists() else 0
+        row.update(status=status, message=redact(message)[:300], seconds=round(time.time() - t0, 1),
+                   size_mb=round(size / 1e6, 3))
         return row
 
     # resume: skip datasets that already finished
@@ -406,7 +433,8 @@ def process_dataset(job):
         try:
             m = json.loads(manifest_path.read_text())
             if m.get("status") in ("ok", "empty", "metadata_only"):
-                row.update(n_series=m.get("n_series", 0), n_observations=m.get("n_observations", 0))
+                row.update(n_series=m.get("n_series", 0), n_observations=m.get("n_observations", 0),
+                           geography=m.get("geography", ""), key_columns=",".join(m.get("key_columns") or []))
                 return done("skipped", "already downloaded (use --force to redo)")
         except ValueError:
             pass
@@ -613,7 +641,7 @@ def main():
     started, results = time.time(), []
     log_path = OUT / "run_log.csv"
     fields = ["dataset_id", "title", "status", "n_series", "n_observations", "geography",
-              "time_query", "value_vars", "key_columns", "message", "seconds"]
+              "time_query", "value_vars", "key_columns", "message", "seconds", "size_mb"]
     print(f"Downloading with {a.workers} parallel workers -> {OUT}\n")
     # maxtasksperchild: restart each worker after a few datasets so memory from big ones is freed
     pool = Pool(a.workers, initializer=init_worker, initargs=(str(OUT), KEY, BASE, SINCE),
@@ -645,11 +673,19 @@ def main():
                "datasets": len(results), "status_counts": dict(status),
                "total_series": sum(r["n_series"] for r in results),
                "total_observations": sum(r["n_observations"] for r in results),
+               "total_size_mb": round(sum(r.get("size_mb", 0) for r in results), 3),
+               "largest_datasets_mb": {r["dataset_id"]: r.get("size_mb", 0) for r in
+                                       sorted(results, key=lambda r: -r.get("size_mb", 0))[:20]},
                "failed": [{"dataset_id": r["dataset_id"], "status": r["status"], "message": r["message"]}
-                          for r in results if r["status"] in ("error", "empty")]}
+                          for r in results if r["status"] in ("error", "empty")],
+               "warnings": [{"dataset_id": r["dataset_id"], "message": r["message"]}
+                            for r in results if r["status"] == "ok" and "duplicate" in r["message"]]}
     write_json(OUT / "run_summary.json", summary)
     print(f"\nDone in {summary['minutes']} min: {dict(status)}")
-    print(f"{summary['total_series']} series, {summary['total_observations']} observations -> {OUT}")
+    print(f"{summary['total_series']} series, {summary['total_observations']} observations, "
+          f"{summary['total_size_mb']} MB -> {OUT}")
+    if summary["warnings"]:
+        print(f"{len(summary['warnings'])} datasets dropped duplicate rows (see run_summary.json 'warnings')")
     print(f"Per-dataset status: {log_path}")
 
 
